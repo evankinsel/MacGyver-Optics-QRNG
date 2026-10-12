@@ -66,6 +66,7 @@ class Config:
     trigger_b_v: float = 0.5
     target_a_events: int = 2_000_000
     max_duration_s: float = 180.0
+    stop_after_duration: bool = False  # True: finish a time-limited segment successfully
     buffer_events: int = 500_000
     poll_interval_s: float = 0.05
     status_every_s: float = 5.0
@@ -253,11 +254,11 @@ def acquire_two_channels(cfg: Config):
             stream.start()
             next_status = start_wall + cfg.status_every_s
 
-            while counts[cfg.channel_a] < cfg.target_a_events:
+            while cfg.stop_after_duration or counts[cfg.channel_a] < cfg.target_a_events:
                 elapsed = time.monotonic() - start_wall
                 if elapsed >= cfg.max_duration_s:
-                    status = "timeout"
-                    problem = "Channel A target not reached before time limit"
+                    status = "complete" if cfg.stop_after_duration else "timeout"
+                    problem = None if cfg.stop_after_duration else "Channel A target not reached before time limit"
                     break
                 time.sleep(cfg.poll_interval_s)
                 try:
@@ -313,7 +314,8 @@ def acquire_two_channels(cfg: Config):
     if a.size:
         # Common Time Tagger timestamp interval, and both channels measured
         # over the same window. A is trimmed to exactly the requested count.
-        a = a[:cfg.target_a_events]
+        if not cfg.stop_after_duration:
+            a = a[:cfg.target_a_events]
         start_ps, stop_ps = int(a[0]), int(a[-1])
         raw[cfg.channel_a] = a
         b = raw[cfg.channel_b]
@@ -324,7 +326,7 @@ def acquire_two_channels(cfg: Config):
         start_ps = stop_ps = None
         raw[cfg.channel_b] = np.empty(0, dtype=np.int64)
 
-    if status == "complete" and a.size < cfg.target_a_events:
+    if status == "complete" and not cfg.stop_after_duration and a.size < cfg.target_a_events:
         status = "timeout"
         problem = "Incomplete primary stream after final drain"
 
@@ -1031,8 +1033,11 @@ def run_point(cfg: Config = CFG, temperature_c=None, ith_ma=None,
               measured_temperature_c=None):
     folder = new_run_directory(cfg)
     note(f"Run directory: {folder.resolve()}")
-    note(f"Capturing channels {cfg.channel_a} AND {cfg.channel_b}; "
-         f"stop target is {cfg.target_a_events:,} events on channel {cfg.channel_a}")
+    if cfg.stop_after_duration:
+        note(f"Capturing channels {cfg.channel_a} AND {cfg.channel_b} for a {cfg.max_duration_s:g}-second segment")
+    else:
+        note(f"Capturing channels {cfg.channel_a} AND {cfg.channel_b}; "
+             f"stop target is {cfg.target_a_events:,} events on channel {cfg.channel_a}")
     try:
         raw, info = acquire_two_channels(cfg)
     except Exception as exc:
@@ -1066,6 +1071,32 @@ def run_point(cfg: Config = CFG, temperature_c=None, ith_ma=None,
         write_json(folder / "analysis_error.json", {"error": f"{type(exc).__name__}: {exc}"})
         raise
     return summary
+
+
+def continuous_recording(cfg: Config = CFG):
+    """No overall time limit: save independent, auditable segments to disk.
+
+    Stop with Ctrl+C in the Spyder IPython console. Each completed segment is
+    saved before the next starts; interrupting the active segment preserves
+    its raw data, although that partial segment is marked interrupted.
+    """
+    segment_no = 0
+    note("CONTINUOUS MODE: no overall timeout; Ctrl+C stops after archiving current segment.")
+    note("Each segment is archived separately so earlier data survives interruptions.")
+    while True:
+        segment_no += 1
+        note(f"===== CONTINUOUS SEGMENT {segment_no} =====")
+        try:
+            report = run_point(cfg, TEMPERATURE_C, ITH_MA, MEASURED_TEMPERATURE_C)
+            if report["acquisition"]["status"] == "interrupted":
+                note("Stopped by operator; interrupted segment raw timestamps were saved.")
+                break
+        except KeyboardInterrupt:
+            note("Stopped by operator. Already completed segments remain saved.")
+            break
+        except Exception as exc:
+            note(f"Continuous recording stopped after error: {type(exc).__name__}: {exc}")
+            break
 
 
 def selftest():
@@ -1176,34 +1207,83 @@ def test_mock_acquisition():
         TimeTagger = original
 
 
-# %% SETTINGS: edit here; F5 to run one mode in Spyder.
-RUN_MODE = "selftest"  # selftest | short | point | sweep | reprocess
-TEMPERATURE_C = None  # e.g., 25.0, or leave None if not logged
-ITH_MA = None          # measured threshold current at this temperature, or None
+# %% SETTINGS: run this script with F5 in Spyder.
+# The menu uses the Spyder IPython console (not the Plots pane).
+RUN_MODE = "menu"  # menu | selftest | short | full | continuous | reprocess
+TEMPERATURE_C = None  # record actual setpoint only if known
+ITH_MA = None          # measured threshold, metadata only
 MEASURED_TEMPERATURE_C = None
-SWEEP_POINTS = []     # [(20.0, measured_ith20), (22.5, measured_ith225), ...]
-REPROCESS_FOLDER = None  # e.g. Path('qrng_data/20261011T...')
+CONTINUOUS_SEGMENT_SECONDS = 15.0  # each segment saved separately; NO overall limit
+REPROCESS_FOLDER = None            # existing qrng_data/<run-id> folder
+
+
+def run_selected(mode):
+    mode = mode.strip().lower()
+    if mode == "selftest":
+        selftest()
+    elif mode == "short":
+        run_point(replace(CFG, target_a_events=100_000, max_duration_s=60),
+                  TEMPERATURE_C, ITH_MA, MEASURED_TEMPERATURE_C)
+    elif mode == "full":
+        run_point(CFG, TEMPERATURE_C, ITH_MA, MEASURED_TEMPERATURE_C)
+    elif mode == "continuous":
+        if CONTINUOUS_SEGMENT_SECONDS <= 0:
+            raise ValueError("CONTINUOUS_SEGMENT_SECONDS must be positive")
+        continuous_recording(replace(CFG, stop_after_duration=True,
+                                     max_duration_s=CONTINUOUS_SEGMENT_SECONDS))
+    elif mode == "reprocess":
+        folder = REPROCESS_FOLDER
+        if folder is None:
+            candidates = sorted((q for q in CFG.out_dir.glob("*")
+                                 if q.is_dir() and (q / "acquisition.json").exists()),
+                                reverse=True)
+            if not candidates:
+                note("No saved runs found.")
+                return
+            print("\nRecent runs:")
+            for i, q in enumerate(candidates[:10], 1):
+                print(f" {i}. {q}")
+            choice = input("Run number (Enter = newest) or folder path: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= min(10, len(candidates)):
+                folder = candidates[int(choice)-1]
+            elif not choice:
+                folder = candidates[0]
+            else:
+                folder = Path(choice)
+        process_saved_run(Path(folder), CFG)
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}")
+
+
+def main_menu():
+    while True:
+        print("\n" + "=" * 55)
+        print("405 nm DUAL-SPAD PHOTON EXPERIMENT | ch2 + ch3")
+        print("=" * 55)
+        print(" 1. Self-test         No hardware required")
+        print(" 2. Short             100,000 channel-A events (60s max)")
+        print(" 3. Full              2,000,000 channel-A events (180s max)")
+        print(" 4. Analyze saved     Reprocess a previous acquisition")
+        print(" 5. Continuous        No overall time limit; Ctrl+C to stop")
+        print(" 0. Exit")
+        choice = input("Select 0-5: ").strip()
+        if choice in ("0", "q", "quit", "exit"):
+            break
+        mode = {"1": "selftest", "2": "short", "3": "full",
+                "4": "reprocess", "5": "continuous"}.get(choice)
+        if mode is None:
+            print("Choose 0, 1, 2, 3, 4 or 5.")
+            continue
+        try:
+            run_selected(mode)
+        except KeyboardInterrupt:
+            note("Interrupted; returning to menu.")
+        except Exception as exc:
+            note(f"Operation failed: {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
-    if RUN_MODE == "selftest":
-        selftest()
-    elif RUN_MODE == "short":
-        short = replace(CFG, target_a_events=100_000, max_duration_s=60)
-        result = run_point(short, TEMPERATURE_C, ITH_MA, MEASURED_TEMPERATURE_C)
-    elif RUN_MODE == "point":
-        result = run_point(CFG, TEMPERATURE_C, ITH_MA, MEASURED_TEMPERATURE_C)
-    elif RUN_MODE == "sweep":
-        if not SWEEP_POINTS:
-            raise ValueError("Provide measured (temperature_C, I_th_mA) in SWEEP_POINTS")
-        for temp, threshold in SWEEP_POINTS:
-            note(f"MANUALLY set TEC to {temp} C, allow thermal soak, and set bias "
-                 f"current per approved procedure (nominal 1.02*I_th={1.02*threshold:.3f} mA)")
-            input("Press Enter only after the operator has confirmed the laser settings...")
-            result = run_point(CFG, temp, threshold)
-    elif RUN_MODE == "reprocess":
-        if REPROCESS_FOLDER is None:
-            raise ValueError("Set REPROCESS_FOLDER to an existing run directory")
-        result = process_saved_run(Path(REPROCESS_FOLDER), CFG)
+    if RUN_MODE == "menu":
+        main_menu()
     else:
-        raise ValueError(f"Unknown RUN_MODE: {RUN_MODE!r}")
+        run_selected(RUN_MODE)
