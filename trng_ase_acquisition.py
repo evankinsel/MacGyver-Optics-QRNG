@@ -51,7 +51,15 @@ FULL_A_EVENTS = 2_000_000
 SHORT_TIMEOUT_S = 60
 FULL_TIMEOUT_S = 180
 STREAM_BUFFER_EVENTS = 500_000
-SAVE_ROOT = Path("qrng_data")
+# Default SAVE_ROOT: prefer the user's Downloads folder for collected runs.
+_DEFAULT_DOWNLOADS = Path.home() / "Downloads"
+if _DEFAULT_DOWNLOADS.exists():
+    _DEFAULT_SAVE_ROOT = _DEFAULT_DOWNLOADS / "qrng_data"
+else:
+    _DEFAULT_SAVE_ROOT = Path("qrng_data")
+# The SAVE_ROOT may be overridden by a per-user config file or the environment
+# variable QRNG_SAVE_ROOT. It can also be changed from the interactive menu.
+SAVE_ROOT: Path = _DEFAULT_SAVE_ROOT
 ANALYZE_FOLDER = None        # None: choose a saved run from the menu
 TOEPLITZ_DEMO = True        # research demonstration, NOT validated key material
 SHOW_FIGURES = True         # display figures in Spyder; always save PNG files
@@ -63,6 +71,8 @@ OPERATOR = None             # name or initials of operator
 SAMPLE_ID = None            # optional sample or run identifier
 RUN_NOTES = None            # free-text notes
 METADATA_USE_GUI = False    # if True, and tkinter is available, use a simple GUI
+# Persistent per-user config path
+_USER_CONFIG = Path.home() / ".qrng_config.json"
 # ================================================
 
 
@@ -193,7 +203,7 @@ def collect(target, timeout):
         "recorded_utc": datetime.now(timezone.utc).isoformat(),
         "temperature_setpoint_C": TEMP_SETPOINT_C,
         "threshold_current_mA": ITH_MA,
-        "laser_bias_current_mA": LASER_BIAS_MA
+        "laser_bias_current_mA": LASER_BIAS_MA,
     }
     return raw, info
 
@@ -353,54 +363,62 @@ def analyze(folder):
     save_json(folder/"bit_statistics.json",results)
 
 
-def run_acquisition(target, timeout):
-    """Perform an acquisition and save richer metadata including operator and notes.
+def _load_user_config():
+    """Load per-user persistent config if available.
 
-    This function prompts for or uses stored metadata, records start/end UTC times,
-    and saves host/process information to the acquisition.json for reproducibility.
+    Supported keys: save_root, operator, metadata_use_gui, sample_id, run_notes
     """
-    global TEMP_SETPOINT_C, ITH_MA, LASER_BIAS_MA, OPERATOR, SAMPLE_ID, RUN_NOTES
-
-    # Prompt for metadata interactively (if running in menu mode)
+    global SAVE_ROOT, OPERATOR, METADATA_USE_GUI, SAMPLE_ID, RUN_NOTES
     try:
-        # Only prompt when running interactively
-        if os.isatty(0):
-            prompt_metadata()
+        if _USER_CONFIG.exists():
+            data = json.loads(_USER_CONFIG.read_text(encoding="utf-8"))
+            save_root = data.get("save_root")
+            if save_root:
+                SAVE_ROOT = Path(save_root).expanduser()
+            OPERATOR = data.get("operator", OPERATOR)
+            SAMPLE_ID = data.get("sample_id", SAMPLE_ID)
+            RUN_NOTES = data.get("run_notes", RUN_NOTES)
+            METADATA_USE_GUI = bool(data.get("metadata_use_gui", METADATA_USE_GUI))
     except Exception:
-        # Ignore prompting failures in non-interactive environments
+        # Do not fail on corrupt config; continue with defaults.
         pass
 
-    SAVE_ROOT.mkdir(parents=True,exist_ok=True)
-    folder=SAVE_ROOT/stamp()
-    folder.mkdir()
-    print("Recording BOTH SPAD inputs; saving to",folder.resolve())
 
-    # Record a precise start time for provenance
-    acquisition_start_utc = datetime.now(timezone.utc).isoformat()
-    raw,info=collect(target,timeout)
-    acquisition_end_utc = datetime.now(timezone.utc).isoformat()
+def _save_user_config():
+    global SAVE_ROOT, OPERATOR, METADATA_USE_GUI, SAMPLE_ID, RUN_NOTES
+    try:
+        cfg = {
+            "save_root": str(SAVE_ROOT),
+            "operator": OPERATOR,
+            "sample_id": SAMPLE_ID,
+            "run_notes": RUN_NOTES,
+            "metadata_use_gui": bool(METADATA_USE_GUI),
+        }
+        _USER_CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        # Best-effort only; do not abort acquisition on config save failures.
+        pass
 
-    # Archive raw timestamps
-    for ch,ts in raw.items():
-        np.save(folder/f"raw_ch{ch}.npy",ts)  # archive even incomplete/lossy runs
 
-    # Enrich and save the acquisition metadata
-    info["acquisition_start_utc"] = acquisition_start_utc
-    info["acquisition_end_utc"] = acquisition_end_utc
-    info["host"] = socket.gethostname()
-    info["pid"] = os.getpid()
-    info["operator"] = OPERATOR
-    info["sample_id"] = SAMPLE_ID
-    info["run_notes"] = RUN_NOTES
-
-    save_json(folder/"acquisition.json",info)
-    print("Acquisition status:",info["status"], "|",info["error"] or "no reported errors")
-    characterize(raw,info,folder)
-    if info["valid"]:
-        analyze(folder)
+def set_save_folder_interactive():
+    """Prompt the user to set the SAVE_ROOT folder and persist it to user config."""
+    global SAVE_ROOT
+    print(f"Current save folder: {SAVE_ROOT}")
+    resp = input("Enter full path to save folder (Enter = keep current, 'D' = use Downloads): ").strip()
+    if not resp:
+        print("Save folder unchanged.")
+        return
+    if resp.upper() == "D":
+        candidate = Path.home() / "Downloads" / "qrng_data"
     else:
-        print("Raw timestamps saved. Bit extraction blocked until a valid acquisition.")
-    print("Results:",folder.resolve())
+        candidate = Path(resp).expanduser()
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        SAVE_ROOT = candidate
+        _save_user_config()
+        print("Save folder set to:", SAVE_ROOT)
+    except Exception as exc:
+        print("Could not set save folder:", exc)
 
 
 def prompt_metadata_interactive():
@@ -433,6 +451,7 @@ def prompt_metadata_interactive():
     TEMP_SETPOINT_C = _prompt_float("TEC setpoint (C)", TEMP_SETPOINT_C)
     ITH_MA = _prompt_float("Measured threshold current I_th (mA)", ITH_MA)
     LASER_BIAS_MA = _prompt_float("Laser bias current (mA)", LASER_BIAS_MA)
+    _save_user_config()
 
 
 def prompt_metadata():
@@ -441,6 +460,7 @@ def prompt_metadata():
     if METADATA_USE_GUI:
         try:
             _prompt_metadata_gui()
+            _save_user_config()
             return
         except Exception:
             # fall back to interactive prompt on failure
@@ -499,7 +519,6 @@ def selftest():
     assert np.array_equal(von_neumann_intervals(np.array([0,5,8,10,14])),
                           np.array([1,0],dtype=np.uint8))
     print("Offline self-test passed: Toeplitz GF(2) and interval comparison")
-
 
 
 def _find_saved_runs():
@@ -564,6 +583,60 @@ def analyze_saved_run(folder=None):
     print("Results saved to", folder.resolve())
 
 
+def run_acquisition(target, timeout):
+    """Perform an acquisition and save richer metadata including operator and notes.
+
+    This function prompts for or uses stored metadata, records start/end UTC times,
+    and saves host/process information to the acquisition.json for reproducibility.
+    """
+    global TEMP_SETPOINT_C, ITH_MA, LASER_BIAS_MA, OPERATOR, SAMPLE_ID, RUN_NOTES, SAVE_ROOT
+
+    # Load persistent user config (if present)
+    _load_user_config()
+
+    # Prompt for metadata interactively (if running in menu mode)
+    try:
+        # Only prompt when running interactively
+        if os.isatty(0):
+            prompt_metadata()
+    except Exception:
+        # Ignore prompting failures in non-interactive environments
+        pass
+
+    SAVE_ROOT.mkdir(parents=True,exist_ok=True)
+    folder=SAVE_ROOT/stamp()
+    folder.mkdir()
+    print("Recording BOTH SPAD inputs; saving to",folder.resolve())
+
+    # Record a precise start time for provenance
+    acquisition_start_utc = datetime.now(timezone.utc).isoformat()
+    raw,info=collect(target,timeout)
+    acquisition_end_utc = datetime.now(timezone.utc).isoformat()
+
+    # Archive raw timestamps
+    for ch,ts in raw.items():
+        np.save(folder/f"raw_ch{ch}.npy",ts)  # archive even incomplete/lossy runs
+
+    # Enrich and save the acquisition metadata
+    info["acquisition_start_utc"] = acquisition_start_utc
+    info["acquisition_end_utc"] = acquisition_end_utc
+    info["host"] = socket.gethostname()
+    info["pid"] = os.getpid()
+    info["operator"] = OPERATOR
+    info["sample_id"] = SAMPLE_ID
+    info["run_notes"] = RUN_NOTES
+    info["save_root"] = str(SAVE_ROOT)
+
+    save_json(folder/"acquisition.json",info)
+    print("Acquisition status:",info["status"], "|",info["error"] or "no reported errors")
+    characterize(raw,info,folder)
+    if info["valid"]:
+        analyze(folder)
+    else:
+        print("Raw timestamps saved. Bit extraction blocked until a valid acquisition.")
+    print("Results:",folder.resolve())
+
+
 def _run_mode(mode):
     if mode == "selftest":
         selftest()
@@ -579,6 +652,8 @@ def _run_mode(mode):
 
 def experiment_menu():
     """Small text menu: an acquisition helper, not a laser-control program."""
+    # Load user config so menu shows current save folder and defaults
+    _load_user_config()
     while True:
         print("\n" + "=" * 53)
         print("   405 nm LASER PHOTON-COUNTING EXPERIMENT")
@@ -588,11 +663,12 @@ def experiment_menu():
         print(f"  3. Full run      {FULL_A_EVENTS:,} A events; record both SPADs")
         print("  4. Analyze data  Open a previously saved experiment")
         print("  5. Edit metadata (operator, notes, measured values)")
+        print("  6. Set save folder (current: ", str(SAVE_ROOT), ")")
         print("  0. Exit")
         print("-" * 53)
         print(f"Inputs: SPAD A = tagger ch{CH_A}; B = ch{CH_B}")
         print("Laser current, temperature and alignment are set manually.")
-        choice = input("Select 0-5: ").strip()
+        choice = input("Select 0-6: ").strip()
         if choice in {"0", "q", "quit", "exit"}:
             print("Experiment menu closed.")
             return
@@ -602,9 +678,15 @@ def experiment_menu():
             except Exception as exc:
                 print("Metadata entry failed:", exc)
             continue
+        if choice == "6":
+            try:
+                set_save_folder_interactive()
+            except Exception as exc:
+                print("Could not change save folder:", exc)
+            continue
         mode = {"1":"selftest", "2":"short", "3":"full", "4":"analyze"}.get(choice)
         if mode is None:
-            print("Choose one of 0, 1, 2, 3, 4 or 5.")
+            print("Choose one of 0, 1, 2, 3, 4, 5 or 6.")
             continue
         try:
             _run_mode(mode)
