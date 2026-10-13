@@ -20,6 +20,8 @@ import json
 import math
 import secrets
 import time
+import socket
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +58,11 @@ SHOW_FIGURES = True         # display figures in Spyder; always save PNG files
 TEMP_SETPOINT_C = None      # enter TEC temperature if measured
 ITH_MA = None               # measured threshold current at this temperature
 LASER_BIAS_MA = None        # manually set current; script DOES NOT set it
+# Extra metadata fields for provenance
+OPERATOR = None             # name or initials of operator
+SAMPLE_ID = None            # optional sample or run identifier
+RUN_NOTES = None            # free-text notes
+METADATA_USE_GUI = False    # if True, and tkinter is available, use a simple GUI
 # ================================================
 
 
@@ -347,13 +354,45 @@ def analyze(folder):
 
 
 def run_acquisition(target, timeout):
+    """Perform an acquisition and save richer metadata including operator and notes.
+
+    This function prompts for or uses stored metadata, records start/end UTC times,
+    and saves host/process information to the acquisition.json for reproducibility.
+    """
+    global TEMP_SETPOINT_C, ITH_MA, LASER_BIAS_MA, OPERATOR, SAMPLE_ID, RUN_NOTES
+
+    # Prompt for metadata interactively (if running in menu mode)
+    try:
+        # Only prompt when running interactively
+        if os.isatty(0):
+            prompt_metadata()
+    except Exception:
+        # Ignore prompting failures in non-interactive environments
+        pass
+
     SAVE_ROOT.mkdir(parents=True,exist_ok=True)
     folder=SAVE_ROOT/stamp()
     folder.mkdir()
     print("Recording BOTH SPAD inputs; saving to",folder.resolve())
+
+    # Record a precise start time for provenance
+    acquisition_start_utc = datetime.now(timezone.utc).isoformat()
     raw,info=collect(target,timeout)
+    acquisition_end_utc = datetime.now(timezone.utc).isoformat()
+
+    # Archive raw timestamps
     for ch,ts in raw.items():
         np.save(folder/f"raw_ch{ch}.npy",ts)  # archive even incomplete/lossy runs
+
+    # Enrich and save the acquisition metadata
+    info["acquisition_start_utc"] = acquisition_start_utc
+    info["acquisition_end_utc"] = acquisition_end_utc
+    info["host"] = socket.gethostname()
+    info["pid"] = os.getpid()
+    info["operator"] = OPERATOR
+    info["sample_id"] = SAMPLE_ID
+    info["run_notes"] = RUN_NOTES
+
     save_json(folder/"acquisition.json",info)
     print("Acquisition status:",info["status"], "|",info["error"] or "no reported errors")
     characterize(raw,info,folder)
@@ -362,6 +401,88 @@ def run_acquisition(target, timeout):
     else:
         print("Raw timestamps saved. Bit extraction blocked until a valid acquisition.")
     print("Results:",folder.resolve())
+
+
+def prompt_metadata_interactive():
+    """Prompt the user for operator/sample metadata and optional numeric values.
+
+    Leaving an entry blank preserves its current value (which may be None).
+    """
+    global TEMP_SETPOINT_C, ITH_MA, LASER_BIAS_MA, OPERATOR, SAMPLE_ID, RUN_NOTES
+
+    def _prompt_text(name, current):
+        cur = "" if current is None else str(current)
+        resp = input(f"{name} [{cur}]: ").strip()
+        return resp if resp else current
+
+    def _prompt_float(name, current):
+        cur = "" if current is None else str(current)
+        resp = input(f"{name} [{cur}]: ").strip()
+        if not resp:
+            return current
+        try:
+            return float(resp)
+        except ValueError:
+            print("Invalid number; leaving unchanged.")
+            return current
+
+    print("Enter run metadata (press Enter to keep current/blank):")
+    OPERATOR = _prompt_text("Operator name/initials", OPERATOR)
+    SAMPLE_ID = _prompt_text("Sample ID", SAMPLE_ID)
+    RUN_NOTES = _prompt_text("Notes", RUN_NOTES)
+    TEMP_SETPOINT_C = _prompt_float("TEC setpoint (C)", TEMP_SETPOINT_C)
+    ITH_MA = _prompt_float("Measured threshold current I_th (mA)", ITH_MA)
+    LASER_BIAS_MA = _prompt_float("Laser bias current (mA)", LASER_BIAS_MA)
+
+
+def prompt_metadata():
+    """Choose interactive or GUI metadata entry depending on availability and setting."""
+    global METADATA_USE_GUI
+    if METADATA_USE_GUI:
+        try:
+            _prompt_metadata_gui()
+            return
+        except Exception:
+            # fall back to interactive prompt on failure
+            pass
+    prompt_metadata_interactive()
+
+
+def _prompt_metadata_gui():
+    """A minimal Tkinter-based metadata dialog. Falls back to text prompts if tkinter missing.
+
+    This is intentionally simple so the script doesn't require heavy GUI deps.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog, messagebox
+    except Exception:
+        raise RuntimeError("Tkinter not available")
+
+    root = tk.Tk()
+    root.withdraw()
+
+    # Ask a few simple fields; default to current globals
+    global TEMP_SETPOINT_C, ITH_MA, LASER_BIAS_MA, OPERATOR, SAMPLE_ID, RUN_NOTES
+    OPERATOR = simpledialog.askstring("Operator", "Operator name/initials:", initialvalue=OPERATOR, parent=root) or OPERATOR
+    SAMPLE_ID = simpledialog.askstring("Sample ID", "Sample ID:", initialvalue=SAMPLE_ID, parent=root) or SAMPLE_ID
+    RUN_NOTES = simpledialog.askstring("Notes", "Notes:", initialvalue=RUN_NOTES, parent=root) or RUN_NOTES
+
+    def _ask_float(title, prompt, current):
+        val = simpledialog.askstring(title, prompt, initialvalue=("" if current is None else str(current)), parent=root)
+        if val is None or val.strip()=="":
+            return current
+        try:
+            return float(val)
+        except ValueError:
+            messagebox.showwarning("Invalid number", f"Could not parse '{val}' as float; value unchanged.")
+            return current
+
+    TEMP_SETPOINT_C = _ask_float("TEC setpoint (C)", "TEC setpoint (C)", TEMP_SETPOINT_C)
+    ITH_MA = _ask_float("Threshold current (mA)", "Measured threshold current I_th (mA)", ITH_MA)
+    LASER_BIAS_MA = _ask_float("Laser bias (mA)", "Laser bias current (mA)", LASER_BIAS_MA)
+
+    root.destroy()
 
 
 def selftest():
@@ -466,17 +587,24 @@ def experiment_menu():
         print(f"  2. Short run     {SHORT_A_EVENTS:,} A events; record both SPADs")
         print(f"  3. Full run      {FULL_A_EVENTS:,} A events; record both SPADs")
         print("  4. Analyze data  Open a previously saved experiment")
+        print("  5. Edit metadata (operator, notes, measured values)")
         print("  0. Exit")
         print("-" * 53)
         print(f"Inputs: SPAD A = tagger ch{CH_A}; B = ch{CH_B}")
         print("Laser current, temperature and alignment are set manually.")
-        choice = input("Select 0-4: ").strip()
+        choice = input("Select 0-5: ").strip()
         if choice in {"0", "q", "quit", "exit"}:
             print("Experiment menu closed.")
             return
+        if choice == "5":
+            try:
+                prompt_metadata()
+            except Exception as exc:
+                print("Metadata entry failed:", exc)
+            continue
         mode = {"1":"selftest", "2":"short", "3":"full", "4":"analyze"}.get(choice)
         if mode is None:
-            print("Choose one of 0, 1, 2, 3 or 4.")
+            print("Choose one of 0, 1, 2, 3, 4 or 5.")
             continue
         try:
             _run_mode(mode)
